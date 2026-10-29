@@ -10,6 +10,11 @@ import gspread
 from flask import Flask, request, abort
 from google.oauth2.service_account import Credentials
 
+
+# =========================================================
+# 1. AYARLAR
+# =========================================================
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]
 ALLOWED_IDS = {int(x) for x in os.environ["ALLOWED_USER_IDS"].split(",") if x.strip()}
@@ -21,7 +26,11 @@ RECS = "Kayitlar"
 MAX_CAT_LEN = 30
 RESTORE_DAYS = 30
 MAX_MSG = 4000
+
+# Inline modda dokunulunca sohbete komut olarak düşen işlemler
 ACTIONS = {"addc", "delc", "restorec", "add", "bitti", "geri", "del"}
+# Inline modda yazılınca botun özel sohbetine yönlendirilen komutlar
+PM_COMMANDS = {"categories", "yardim", "help"}
 
 HELP = (
     "📖 Komutlar\n\n"
@@ -58,7 +67,9 @@ app = Flask(__name__)
 _seen_updates = set()
 
 
-# ---------- Yardımcılar ----------
+# =========================================================
+# 2. YARDIMCILAR (zaman, metin, Telegram, Sheets erişimi)
+# =========================================================
 
 def now():
     return datetime.now(TZ)
@@ -72,29 +83,6 @@ def norm(s):
     """Küçük harf + Türkçe karakter sadeleştirme. 'Müzik' ve 'muzik' aynı sayılır."""
     s = str(s).strip().replace("İ", "i").replace("I", "i").lower()
     return s.translate(str.maketrans("ığşüöç", "igsuoc"))
-
-
-@lru_cache(maxsize=1)
-def book():
-    info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
-    creds = Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    return gspread.authorize(creds).open_by_key(SHEET_ID)
-
-
-def get_ws(tab):
-    """Sekmeyi büyük/küçük harf ve Türkçe karakterden bağımsız bulur."""
-    sh = book()
-    titles = [w.title for w in sh.worksheets()]
-    for t in titles:
-        if norm(t) == norm(tab):
-            return sh.worksheet(t)
-    raise RuntimeError(f"Sekme bulunamadı: '{tab}'. Mevcut sekmeler: {titles}")
-
-
-def rows(tab):
-    return get_ws(tab).get_all_records()
 
 
 def tg(method, payload):
@@ -120,15 +108,49 @@ def set_commands():
 set_commands()
 
 
+@lru_cache(maxsize=1)
+def book():
+    info = json.loads(os.environ["GOOGLE_CREDENTIALS_JSON"])
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return gspread.authorize(creds).open_by_key(SHEET_ID)
+
+
+def get_ws(tab):
+    """Sekmeyi büyük/küçük harf ve Türkçe karakterden bağımsız bulur."""
+    sh = book()
+    titles = [w.title for w in sh.worksheets()]
+    for t in titles:
+        if norm(t) == norm(tab):
+            return sh.worksheet(t)
+    raise RuntimeError(f"Sekme bulunamadı: '{tab}'. Mevcut sekmeler: {titles}")
+
+
+def rows(tab):
+    return get_ws(tab).get_all_records()
+
+
 def find_cat(key):
-    """(satır_no, kategori_sözlüğü) döndürür. Satır 1 tabanlı, başlık dahil."""
+    """(satır_no, kategori) döndürür. Satır 1 tabanlı, başlık dahil."""
     for i, r in enumerate(rows(CATS), start=2):
         if str(r["anahtar"]) == key:
             return i, r
     return None, None
 
 
-# ---------- Kategori işlemleri ----------
+def active_cat(name):
+    """Aktif kategoriyi döndürür: (satır_no, kategori, anahtar). Yoksa None."""
+    key = norm(name)
+    row, cat = find_cat(key)
+    if not cat or cat["durum"] != "aktif":
+        return None
+    return row, cat, key
+
+
+# =========================================================
+# 3. KATEGORİ İŞLEMLERİ
+# =========================================================
 
 def add_category(name):
     name = name.strip()
@@ -154,10 +176,10 @@ def list_categories():
 
 
 def delete_category(name, confirm):
-    key = norm(name)
-    row, cat = find_cat(key)
-    if not cat or cat["durum"] != "aktif":
+    found = active_cat(name)
+    if not found:
         return "Aktif böyle bir kategori yok."
+    row, cat, key = found
     count = sum(
         1 for r in rows(RECS)
         if r["kategori"] == key and r["durum"] != "silindi"
@@ -190,13 +212,15 @@ def restore_category(name):
     return f"♻️ '{cat['ad']}' geri getirildi."
 
 
-# ---------- Kayıt işlemleri ----------
+# =========================================================
+# 4. KAYIT İŞLEMLERİ
+# =========================================================
 
 def add_record(cat_name, content, user):
-    key = norm(cat_name)
-    _, cat = find_cat(key)
-    if not cat or cat["durum"] != "aktif":
+    found = active_cat(cat_name)
+    if not found:
         return f"'{cat_name}' kategorisi yok. Önce /addc {cat_name} yazın."
+    _, cat, key = found
     content = content.strip()
     if not content:
         return f"Kullanım: /add {cat_name} sokagın ruyası"
@@ -238,10 +262,10 @@ def find_record(cat_key, text):
 
 
 def set_record_status(cat_name, text, status, label):
-    key = norm(cat_name)
-    _, cat = find_cat(key)
-    if not cat or cat["durum"] != "aktif":
+    found = active_cat(cat_name)
+    if not found:
         return f"'{cat_name}' kategorisi yok."
+    _, _, key = found
     hit, err = find_record(key, text)
     if err:
         return err
@@ -251,10 +275,10 @@ def set_record_status(cat_name, text, status, label):
 
 
 def list_records(cmd):
-    key = norm(cmd)
-    _, cat = find_cat(key)
-    if not cat or cat["durum"] != "aktif":
+    found = active_cat(cmd)
+    if not found:
         return "Bilinmeyen komut veya kategori. /yardim yazın."
+    _, cat, key = found
     items = [
         r for r in rows(RECS)
         if r["kategori"] == key and r["durum"] != "silindi"
@@ -268,7 +292,9 @@ def list_records(cmd):
     return f"📌 {cat['ad']}\n" + "\n".join(lines)
 
 
-# ---------- Komut yönlendirme (normal mesajlar) ----------
+# =========================================================
+# 5. KOMUT YÖNLENDİRME (normal mesajlar ve /start parametresi)
+# =========================================================
 
 def handle(user, text):
     if not text.startswith("/"):
@@ -276,6 +302,16 @@ def handle(user, text):
     parts = text.split()
     cmd = parts[0][1:].split("@")[0].lower()
     args = parts[1:]
+
+    # /start: switch_pm ile gelen parametre varsa onu komut gibi çalıştır
+    if cmd == "start":
+        if not args:
+            return HELP
+        cmd, args = args[0].lower(), args[1:]
+        text = "/" + cmd + (" " + " ".join(args) if args else "")
+
+    if cmd in ("yardim", "help"):
+        return HELP
 
     # Kategori
     if cmd == "addc":
@@ -307,24 +343,23 @@ def handle(user, text):
             return set_record_status(args[0], content, "tamamlandi", "✅ Tamamlandı")
         return set_record_status(args[0], content, "bekliyor", "↩️ Geri alındı")
 
-    if cmd in ("yardim", "help", "start"):
-        return HELP
-
     # Kategori adıyla listeleme: /music, /muzik, /film ...
     return list_records(cmd)
 
 
-# ---------- Inline mod (ortak sohbet) ----------
+# =========================================================
+# 6. INLINE MOD (ortak sohbet)
+# =========================================================
 
 def inline_results(query):
-    """@bot yazılan metne göre sonuç listesi üretir. Yazma yapmaz."""
+    """Listeleme ve işlem sonuçlarını üretir. Yazma yapmaz."""
     q = query.strip()
     if not q:
         return []
     parts = q.split(maxsplit=1)
     first = norm(parts[0])
 
-    # İşlem sonuçları: dokununca chosen_inline_result ile çalışır
+    # İşlem: dokununca komut sohbete düşer
     if first in ACTIONS:
         needed = 2 if first in ("addc", "delc", "restorec") else 3
         if len(q.split()) < needed:
@@ -338,43 +373,61 @@ def inline_results(query):
         }]
 
     # Listeleme: "music" veya "music sokak"
-    _, cat = find_cat(first)
-    if not cat or cat["durum"] != "aktif":
+    found = active_cat(first)
+    if not found:
         return []
+    _, cat, key = found
     filt = norm(parts[1]) if len(parts) > 1 else ""
     items = [
         r for r in rows(RECS)
-        if r["kategori"] == first and r["durum"] != "silindi"
+        if r["kategori"] == key and r["durum"] != "silindi"
         and (not filt or filt in r["icerik_anahtar"])
     ]
-    results = []
-    for i, r in enumerate(items[:50]):
-        mark = "✅ " if r["durum"] == "tamamlandi" else ""
-        results.append({
+    return [
+        {
             "type": "article",
             "id": f"l{i}",
-            "title": f"{mark}{r['icerik']}",
+            "title": f"{'✅ ' if r['durum'] == 'tamamlandi' else ''}{r['icerik']}",
             "description": f"{cat['ad']} · {r['ekleyen']}",
             "input_message_content": {"message_text": r["icerik"]},
-        })
-    return results
+        }
+        for i, r in enumerate(items[:50])
+    ]
+
+
+def answer_inline(iq, results, switch_text=None, switch_param=None):
+    payload = {
+        "inline_query_id": iq["id"],
+        "results": results,
+        "cache_time": 0,
+        "is_personal": True,
+    }
+    if switch_text and switch_param:
+        payload["switch_pm_text"] = switch_text
+        payload["switch_pm_parameter"] = switch_param
+    tg("answerInlineQuery", payload)
 
 
 def handle_inline(iq):
     user = iq.get("from", {})
     if user.get("id") not in ALLOWED_IDS:
         return  # yetkisiz: hiç yanıt yok
+
+    query = iq.get("query", "").strip()
+    first = norm(query.split()[0]) if query else ""
+
+    # categories / yardim: sonuç yerine botun özel sohbetine yönlendir
+    if first in PM_COMMANDS:
+        label = "Kategorileri listele" if first == "categories" else "Komut listesi"
+        answer_inline(iq, [], switch_text=label, switch_param=first)
+        return
+
     try:
-        results = inline_results(iq.get("query", ""))
+        results = inline_results(query)
     except Exception:
         app.logger.exception("Inline hatası")
         results = []
-    tg("answerInlineQuery", {
-        "inline_query_id": iq["id"],
-        "results": results,
-        "cache_time": 0,
-        "is_personal": True,
-    })
+    answer_inline(iq, results)
 
 
 def handle_chosen(ch):
@@ -382,19 +435,20 @@ def handle_chosen(ch):
     if user.get("id") not in ALLOWED_IDS:
         return
     if not str(ch.get("result_id", "")).startswith("act"):
-        return  # listeleme sonuçlarında yazma yok
+        return  # listeleme sonuçlarında işlem yok
     text = "/" + ch.get("query", "").strip()
     try:
         reply = handle(user, text)
     except Exception as e:
         app.logger.exception("Chosen hatası")
         reply = f"⚠️ Hata: {type(e).__name__}: {str(e)[:300]}"
-    # Sonucu botun size özel sohbetinize gönderiyoruz
     if reply:
         send(user["id"], reply)
 
 
-# ---------- Webhook ----------
+# =========================================================
+# 7. WEBHOOK (tek giriş noktası)
+# =========================================================
 
 @app.get("/")
 def health():
