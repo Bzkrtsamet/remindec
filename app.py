@@ -1,6 +1,7 @@
 import os
 import json
 import uuid
+import logging
 from datetime import datetime, timedelta
 from functools import lru_cache
 from zoneinfo import ZoneInfo
@@ -27,7 +28,6 @@ MAX_CAT_LEN = 30
 RESTORE_DAYS = 30
 MAX_MSG = 4000
 
-# Inline modda dokunulunca sohbete komut olarak düşen işlemler
 ACTIONS = {"addc", "delc", "restorec", "add", "bitti", "geri", "del"}
 
 HELP = (
@@ -62,11 +62,12 @@ COMMANDS = [
 ]
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 _seen_updates = set()
 
 
 # =========================================================
-# 2. YARDIMCILAR (zaman, metin, Telegram, Sheets erişimi)
+# 2. YARDIMCILAR
 # =========================================================
 
 def now():
@@ -84,11 +85,14 @@ def norm(s):
 
 
 def tg(method, payload):
-    return requests.post(
+    r = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/{method}",
         json=payload,
         timeout=10,
     )
+    if not r.ok:
+        app.logger.error("Telegram %s hatası: %s", method, r.text[:300])
+    return r
 
 
 def send(chat_id, text):
@@ -147,7 +151,7 @@ def active_cat(name):
 
 
 # =========================================================
-# 3. LİSTE BİÇİMLENDİRME (tek yerden)
+# 3. LİSTE BİÇİMLENDİRME
 # =========================================================
 
 def record_items(key, recs, filt=""):
@@ -303,7 +307,7 @@ def list_records(cmd):
 
 
 # =========================================================
-# 6. KOMUT YÖNLENDİRME (normal mesajlar)
+# 6. KOMUT YÖNLENDİRME
 # =========================================================
 
 def handle(user, text):
@@ -316,7 +320,6 @@ def handle(user, text):
     if cmd in ("start", "yardim", "help"):
         return HELP
 
-    # Kategori
     if cmd == "addc":
         if len(args) != 1:
             return "Kullanım: /addc music"
@@ -331,7 +334,6 @@ def handle(user, text):
     if cmd == "categories":
         return categories_text()
 
-    # Kayıt
     if cmd == "add":
         if len(args) < 2:
             return "Kullanım: /add music sokagın ruyası"
@@ -346,13 +348,11 @@ def handle(user, text):
             return set_record_status(args[0], content, "tamamlandi", "✅ Tamamlandı")
         return set_record_status(args[0], content, "bekliyor", "↩️ Geri alındı")
 
-    # Kategori adıyla listeleme: /music, /muzik, /film ...
     return list_records(cmd)
 
 
 # =========================================================
-# 7. INLINE MOD (ortak sohbet)
-#    Kart önizlemesi kısa, dokununca sohbete tam biçimli liste gider.
+# 7. INLINE MOD
 # =========================================================
 
 def cat_card(cat, key, items):
@@ -387,12 +387,19 @@ def help_card():
 
 
 def action_card(q):
+    """
+    Düğme (reply_markup) eklenir ki Telegram gönderilen mesajın
+    inline_message_id değerini bota versin. Bot sonra mesajı düzenleyebilir.
+    """
     return {
         "type": "article",
         "id": "act",
         "title": f"▶ {q}",
-        "description": "Dokununca çalışır ve sohbete yazılır",
-        "input_message_content": {"message_text": f"/{q}"},
+        "description": "Dokununca çalışır, sonuç ve güncel liste görünür",
+        "input_message_content": {"message_text": f"⏳ {q}"},
+        "reply_markup": {
+            "inline_keyboard": [[{"text": "⏳ İşleniyor...", "callback_data": "noop"}]]
+        },
     }
 
 
@@ -401,7 +408,6 @@ def inline_results(query):
     parts = q.split(maxsplit=1)
     first = norm(parts[0]) if parts else ""
 
-    # Boş sorgu: kategori kartları + komutlar kartı
     if not q:
         recs = rows(RECS)
         cards = [cats_card()]
@@ -418,14 +424,12 @@ def inline_results(query):
     if first in ("yardim", "help"):
         return [help_card()]
 
-    # İşlem: dokununca komut sohbete düşer
     if first in ACTIONS:
         needed = 2 if first in ("addc", "delc", "restorec") else 3
         if len(q.split()) < needed:
             return []
         return [action_card(q)]
 
-    # Listeleme: "music" veya "music sokak"
     found = active_cat(first)
     if not found:
         return []
@@ -438,7 +442,7 @@ def inline_results(query):
 def handle_inline(iq):
     user = iq.get("from", {})
     if user.get("id") not in ALLOWED_IDS:
-        return  # yetkisiz: hiç yanıt yok
+        return
     try:
         results = inline_results(iq.get("query", ""))
     except Exception:
@@ -452,24 +456,63 @@ def handle_inline(iq):
     })
 
 
+def refresh_text(q, reply):
+    """Sonuç mesajının altına, işlemin yapıldığı kategorinin güncel listesini ekler."""
+    parts = q.split()
+    if len(parts) < 2:
+        return reply
+    found = active_cat(parts[1])
+    if not found:
+        return reply
+    _, cat, key = found
+    items = record_items(key, rows(RECS))
+    return f"{reply}\n\n{list_text(cat['ad'], items)}"[:MAX_MSG]
+
+
+def edit_inline(inline_message_id, text):
+    tg("editMessageText", {
+        "inline_message_id": inline_message_id,
+        "text": text[:MAX_MSG],
+    })
+
+
 def handle_chosen(ch):
     user = ch.get("from", {})
+    app.logger.warning(
+        "CHOSEN id=%s query=%r user=%s",
+        ch.get("result_id"), ch.get("query"), user.get("id"),
+    )
     if user.get("id") not in ALLOWED_IDS:
         return
     if not str(ch.get("result_id", "")).startswith("act"):
-        return  # liste kartları zaten sohbete metin olarak gider
-    text = "/" + ch.get("query", "").strip()
+        return
+
+    q = ch.get("query", "").strip()
     try:
-        reply = handle(user, text)
+        reply = handle(user, "/" + q)
     except Exception as e:
         app.logger.exception("Chosen hatası")
         reply = f"⚠️ Hata: {type(e).__name__}: {str(e)[:300]}"
-    if reply:
+
+    app.logger.warning("CHOSEN yanıt: %r", (reply or "")[:200])
+    if not reply:
+        return
+
+    inline_message_id = ch.get("inline_message_id")
+    if inline_message_id:
+        try:
+            text = refresh_text(q, reply)
+        except Exception:
+            app.logger.exception("Liste yenileme hatası")
+            text = reply
+        edit_inline(inline_message_id, text)
+    else:
+        # inline_message_id gelmezse yanıtı özel sohbete gönder
         send(user["id"], reply)
 
 
 # =========================================================
-# 8. WEBHOOK (tek giriş noktası)
+# 8. WEBHOOK
 # =========================================================
 
 @app.get("/")
@@ -494,6 +537,8 @@ def webhook():
     if "chosen_inline_result" in update:
         handle_chosen(update["chosen_inline_result"])
         return "ok"
+    if "callback_query" in update:
+        return "ok"  # ⏳ düğmesine basılırsa sessizce geç
 
     msg = update.get("message")
     if not msg or "text" not in msg:
@@ -501,7 +546,7 @@ def webhook():
 
     user = msg.get("from", {})
     if user.get("id") not in ALLOWED_IDS:
-        return "ok"  # yetkisiz kullanıcı: hiç yanıt yok
+        return "ok"
 
     try:
         reply = handle(user, msg["text"])
