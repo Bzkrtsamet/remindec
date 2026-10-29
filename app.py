@@ -29,8 +29,6 @@ MAX_MSG = 4000
 
 # Inline modda dokunulunca sohbete komut olarak düşen işlemler
 ACTIONS = {"addc", "delc", "restorec", "add", "bitti", "geri", "del"}
-# Inline modda yazılınca botun özel sohbetine yönlendirilen komutlar
-PM_COMMANDS = {"categories", "yardim", "help"}
 
 HELP = (
     "📖 Komutlar\n\n"
@@ -149,7 +147,39 @@ def active_cat(name):
 
 
 # =========================================================
-# 3. KATEGORİ İŞLEMLERİ
+# 3. LİSTE BİÇİMLENDİRME (tek yerden)
+# =========================================================
+
+def record_items(key, recs, filt=""):
+    """Bir kategoriye ait görünür kayıtları döndürür."""
+    return [
+        r for r in recs
+        if r["kategori"] == key
+        and r["durum"] != "silindi"
+        and (not filt or filt in r["icerik_anahtar"])
+    ]
+
+
+def list_text(title, items):
+    """Sohbete gönderilecek tam, numaralı liste metni."""
+    if not items:
+        return f"📌 {title}\nHenüz kayıt yok."
+    lines = []
+    for i, r in enumerate(items, 1):
+        mark = "✅ " if r["durum"] == "tamamlandi" else ""
+        lines.append(f"{i}. {mark}{r['icerik']}  [{r['ekleyen']}]")
+    return (f"📌 {title}\n" + "\n".join(lines))[:MAX_MSG]
+
+
+def categories_text():
+    active = [str(r["ad"]) for r in rows(CATS) if r["durum"] == "aktif"]
+    if not active:
+        return "Henüz kategori yok. /addc music ile başlayın."
+    return "📂 Kategoriler:\n" + "\n".join(f"• {a}" for a in active)
+
+
+# =========================================================
+# 4. KATEGORİ İŞLEMLERİ
 # =========================================================
 
 def add_category(name):
@@ -168,22 +198,12 @@ def add_category(name):
     return f"✅ '{name}' kategorisi oluşturuldu."
 
 
-def list_categories():
-    active = [str(r["ad"]) for r in rows(CATS) if r["durum"] == "aktif"]
-    if not active:
-        return "Henüz kategori yok. /addc music ile başlayın."
-    return "📂 Kategoriler:\n" + "\n".join(f"• {a}" for a in active)
-
-
 def delete_category(name, confirm):
     found = active_cat(name)
     if not found:
         return "Aktif böyle bir kategori yok."
     row, cat, key = found
-    count = sum(
-        1 for r in rows(RECS)
-        if r["kategori"] == key and r["durum"] != "silindi"
-    )
+    count = len(record_items(key, rows(RECS)))
     if not confirm:
         return (
             f"⚠️ '{cat['ad']}' arşivlenecek ({count} kayıt gizlenecek).\n"
@@ -213,7 +233,7 @@ def restore_category(name):
 
 
 # =========================================================
-# 4. KAYIT İŞLEMLERİ
+# 5. KAYIT İŞLEMLERİ
 # =========================================================
 
 def add_record(cat_name, content, user):
@@ -279,21 +299,11 @@ def list_records(cmd):
     if not found:
         return "Bilinmeyen komut veya kategori. /yardim yazın."
     _, cat, key = found
-    items = [
-        r for r in rows(RECS)
-        if r["kategori"] == key and r["durum"] != "silindi"
-    ]
-    if not items:
-        return f"{cat['ad']} listesi boş. /add {cat['ad']} ... ile ekleyin."
-    lines = []
-    for i, r in enumerate(items, 1):
-        mark = "✅ " if r["durum"] == "tamamlandi" else ""
-        lines.append(f"{i}. {mark}{r['icerik']}  [{r['ekleyen']}]")
-    return f"📌 {cat['ad']}\n" + "\n".join(lines)
+    return list_text(cat["ad"], record_items(key, rows(RECS)))
 
 
 # =========================================================
-# 5. KOMUT YÖNLENDİRME (normal mesajlar ve /start parametresi)
+# 6. KOMUT YÖNLENDİRME (normal mesajlar)
 # =========================================================
 
 def handle(user, text):
@@ -303,14 +313,7 @@ def handle(user, text):
     cmd = parts[0][1:].split("@")[0].lower()
     args = parts[1:]
 
-    # /start: switch_pm ile gelen parametre varsa onu komut gibi çalıştır
-    if cmd == "start":
-        if not args:
-            return HELP
-        cmd, args = args[0].lower(), args[1:]
-        text = "/" + cmd + (" " + " ".join(args) if args else "")
-
-    if cmd in ("yardim", "help"):
+    if cmd in ("start", "yardim", "help"):
         return HELP
 
     # Kategori
@@ -326,7 +329,7 @@ def handle(user, text):
     if cmd == "restorec":
         return restore_category(args[0]) if args else "Kullanım: /restorec music"
     if cmd == "categories":
-        return list_categories()
+        return categories_text()
 
     # Kayıt
     if cmd == "add":
@@ -348,29 +351,79 @@ def handle(user, text):
 
 
 # =========================================================
-# 6. INLINE MOD (ortak sohbet)
+# 7. INLINE MOD (ortak sohbet)
+#    Kart önizlemesi kısa, dokununca sohbete tam biçimli liste gider.
 # =========================================================
 
+def cat_card(cat, key, items):
+    preview = " · ".join(r["icerik"] for r in items[:5]) or "Henüz kayıt yok"
+    return {
+        "type": "article",
+        "id": f"cat-{key}"[:64],
+        "title": f"📌 {cat['ad']} ({len(items)})",
+        "description": preview[:200],
+        "input_message_content": {"message_text": list_text(cat["ad"], items)},
+    }
+
+
+def cats_card():
+    return {
+        "type": "article",
+        "id": "cats",
+        "title": "📂 Kategoriler",
+        "description": "Tüm kategorilerin listesi",
+        "input_message_content": {"message_text": categories_text()},
+    }
+
+
+def help_card():
+    return {
+        "type": "article",
+        "id": "help",
+        "title": "📖 Komutlar",
+        "description": "Tüm komutların listesi",
+        "input_message_content": {"message_text": HELP},
+    }
+
+
+def action_card(q):
+    return {
+        "type": "article",
+        "id": "act",
+        "title": f"▶ {q}",
+        "description": "Dokununca çalışır ve sohbete yazılır",
+        "input_message_content": {"message_text": f"/{q}"},
+    }
+
+
 def inline_results(query):
-    """Listeleme ve işlem sonuçlarını üretir. Yazma yapmaz."""
     q = query.strip()
-    if not q:
-        return []
     parts = q.split(maxsplit=1)
-    first = norm(parts[0])
+    first = norm(parts[0]) if parts else ""
+
+    # Boş sorgu: kategori kartları + komutlar kartı
+    if not q:
+        recs = rows(RECS)
+        cards = [cats_card()]
+        for r in rows(CATS):
+            if r["durum"] != "aktif":
+                continue
+            key = str(r["anahtar"])
+            cards.append(cat_card(r, key, record_items(key, recs)))
+        cards.append(help_card())
+        return cards[:50]
+
+    if first == "categories":
+        return [cats_card()]
+    if first in ("yardim", "help"):
+        return [help_card()]
 
     # İşlem: dokununca komut sohbete düşer
     if first in ACTIONS:
         needed = 2 if first in ("addc", "delc", "restorec") else 3
         if len(q.split()) < needed:
             return []
-        return [{
-            "type": "article",
-            "id": "act",
-            "title": f"▶ {q}",
-            "description": "Dokununca çalışır ve sohbete yazılır",
-            "input_message_content": {"message_text": f"/{q}"},
-        }]
+        return [action_card(q)]
 
     # Listeleme: "music" veya "music sokak"
     found = active_cat(first)
@@ -378,56 +431,25 @@ def inline_results(query):
         return []
     _, cat, key = found
     filt = norm(parts[1]) if len(parts) > 1 else ""
-    items = [
-        r for r in rows(RECS)
-        if r["kategori"] == key and r["durum"] != "silindi"
-        and (not filt or filt in r["icerik_anahtar"])
-    ]
-    return [
-        {
-            "type": "article",
-            "id": f"l{i}",
-            "title": f"{'✅ ' if r['durum'] == 'tamamlandi' else ''}{r['icerik']}",
-            "description": f"{cat['ad']} · {r['ekleyen']}",
-            "input_message_content": {"message_text": r["icerik"]},
-        }
-        for i, r in enumerate(items[:50])
-    ]
-
-
-def answer_inline(iq, results, switch_text=None, switch_param=None):
-    payload = {
-        "inline_query_id": iq["id"],
-        "results": results,
-        "cache_time": 0,
-        "is_personal": True,
-    }
-    if switch_text and switch_param:
-        payload["switch_pm_text"] = switch_text
-        payload["switch_pm_parameter"] = switch_param
-    tg("answerInlineQuery", payload)
+    items = record_items(key, rows(RECS), filt)
+    return [cat_card(cat, key, items)]
 
 
 def handle_inline(iq):
     user = iq.get("from", {})
     if user.get("id") not in ALLOWED_IDS:
         return  # yetkisiz: hiç yanıt yok
-
-    query = iq.get("query", "").strip()
-    first = norm(query.split()[0]) if query else ""
-
-    # categories / yardim: sonuç yerine botun özel sohbetine yönlendir
-    if first in PM_COMMANDS:
-        label = "Kategorileri listele" if first == "categories" else "Komut listesi"
-        answer_inline(iq, [], switch_text=label, switch_param=first)
-        return
-
     try:
-        results = inline_results(query)
+        results = inline_results(iq.get("query", ""))
     except Exception:
         app.logger.exception("Inline hatası")
         results = []
-    answer_inline(iq, results)
+    tg("answerInlineQuery", {
+        "inline_query_id": iq["id"],
+        "results": results,
+        "cache_time": 0,
+        "is_personal": True,
+    })
 
 
 def handle_chosen(ch):
@@ -435,7 +457,7 @@ def handle_chosen(ch):
     if user.get("id") not in ALLOWED_IDS:
         return
     if not str(ch.get("result_id", "")).startswith("act"):
-        return  # listeleme sonuçlarında işlem yok
+        return  # liste kartları zaten sohbete metin olarak gider
     text = "/" + ch.get("query", "").strip()
     try:
         reply = handle(user, text)
@@ -447,7 +469,7 @@ def handle_chosen(ch):
 
 
 # =========================================================
-# 7. WEBHOOK (tek giriş noktası)
+# 8. WEBHOOK (tek giriş noktası)
 # =========================================================
 
 @app.get("/")
