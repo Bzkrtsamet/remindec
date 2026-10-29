@@ -21,6 +21,7 @@ RECS = "Kayitlar"
 MAX_CAT_LEN = 30
 RESTORE_DAYS = 30
 MAX_MSG = 4000
+ACTIONS = {"addc", "delc", "restorec", "add", "bitti", "geri", "del"}
 
 HELP = (
     "📖 Komutlar\n\n"
@@ -37,7 +38,8 @@ HELP = (
     "/del music sokagın ruyası : kaydı sil\n\n"
     "Listeleme:\n"
     "/music : müzik listesini göster\n"
-    "(her kategori adı kendi listesini açar)"
+    "(her kategori adı kendi listesini açar)\n\n"
+    "Ortak sohbette: @botadi music yazın"
 )
 
 COMMANDS = [
@@ -266,7 +268,7 @@ def list_records(cmd):
     return f"📌 {cat['ad']}\n" + "\n".join(lines)
 
 
-# ---------- Komut yönlendirme ----------
+# ---------- Komut yönlendirme (normal mesajlar) ----------
 
 def handle(user, text):
     if not text.startswith("/"):
@@ -312,6 +314,88 @@ def handle(user, text):
     return list_records(cmd)
 
 
+# ---------- Inline mod (ortak sohbet) ----------
+
+def inline_results(query):
+    """@bot yazılan metne göre sonuç listesi üretir. Yazma yapmaz."""
+    q = query.strip()
+    if not q:
+        return []
+    parts = q.split(maxsplit=1)
+    first = norm(parts[0])
+
+    # İşlem sonuçları: dokununca chosen_inline_result ile çalışır
+    if first in ACTIONS:
+        needed = 2 if first in ("addc", "delc", "restorec") else 3
+        if len(q.split()) < needed:
+            return []
+        return [{
+            "type": "article",
+            "id": "act",
+            "title": f"▶ {q}",
+            "description": "Dokununca çalışır ve sohbete yazılır",
+            "input_message_content": {"message_text": f"/{q}"},
+        }]
+
+    # Listeleme: "music" veya "music sokak"
+    _, cat = find_cat(first)
+    if not cat or cat["durum"] != "aktif":
+        return []
+    filt = norm(parts[1]) if len(parts) > 1 else ""
+    items = [
+        r for r in rows(RECS)
+        if r["kategori"] == first and r["durum"] != "silindi"
+        and (not filt or filt in r["icerik_anahtar"])
+    ]
+    results = []
+    for i, r in enumerate(items[:50]):
+        mark = "✅ " if r["durum"] == "tamamlandi" else ""
+        results.append({
+            "type": "article",
+            "id": f"l{i}",
+            "title": f"{mark}{r['icerik']}",
+            "description": f"{cat['ad']} · {r['ekleyen']}",
+            "input_message_content": {"message_text": r["icerik"]},
+        })
+    return results
+
+
+def handle_inline(iq):
+    user = iq.get("from", {})
+    if user.get("id") not in ALLOWED_IDS:
+        return  # yetkisiz: hiç yanıt yok
+    try:
+        results = inline_results(iq.get("query", ""))
+    except Exception:
+        app.logger.exception("Inline hatası")
+        results = []
+    tg("answerInlineQuery", {
+        "inline_query_id": iq["id"],
+        "results": results,
+        "cache_time": 0,
+        "is_personal": True,
+    })
+
+
+def handle_chosen(ch):
+    user = ch.get("from", {})
+    if user.get("id") not in ALLOWED_IDS:
+        return
+    if not str(ch.get("result_id", "")).startswith("act"):
+        return  # listeleme sonuçlarında yazma yok
+    text = "/" + ch.get("query", "").strip()
+    try:
+        reply = handle(user, text)
+    except Exception as e:
+        app.logger.exception("Chosen hatası")
+        reply = f"⚠️ Hata: {type(e).__name__}: {str(e)[:300]}"
+    # Sonucu botun size özel sohbetinize gönderiyoruz
+    if reply:
+        send(user["id"], reply)
+
+
+# ---------- Webhook ----------
+
 @app.get("/")
 def health():
     return "ok"
@@ -327,6 +411,13 @@ def webhook():
     if update_id in _seen_updates:
         return "ok"
     _seen_updates.add(update_id)
+
+    if "inline_query" in update:
+        handle_inline(update["inline_query"])
+        return "ok"
+    if "chosen_inline_result" in update:
+        handle_chosen(update["chosen_inline_result"])
+        return "ok"
 
     msg = update.get("message")
     if not msg or "text" not in msg:
